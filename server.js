@@ -4,6 +4,7 @@ const express=require('express'),bcrypt=require('bcryptjs'),jwt=require('jsonweb
 if(!process.env.JWT_SECRET||process.env.JWT_SECRET.length<32){console.error('Set JWT_SECRET (at least 32 characters).');process.exit(1)}
 
 const DATA_FILE=process.env.DATA_FILE||path.join(__dirname,'data.json');
+fs.mkdirSync(path.dirname(DATA_FILE),{recursive:true});
 const app=express();
 app.disable('x-powered-by');
 app.set('trust proxy',1);
@@ -25,7 +26,7 @@ function loadDb(){
 }
 
 function saveDb(){
-  writing=writing.then(()=>new Promise((res,rej)=>{
+  writing=writing.catch(e=>{console.error('Previous write failed',e)}).then(()=>new Promise((res,rej)=>{
     const tmp=DATA_FILE+'.tmp';
     fs.writeFile(tmp,JSON.stringify(db,null,2),(err)=>{
       if(err)return rej(err);
@@ -39,11 +40,12 @@ function saveDb(){
 // ---- CORS: accept every origin ---------------------------------------------
 app.use((req,res,next)=>{
   const origin=req.get('Origin');
-  if(origin){
+  const allowed=(process.env.FRONTEND_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean);
+  if(origin && (allowed.includes(origin) || (process.env.NODE_ENV!=='production' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)))){
     res.setHeader('Access-Control-Allow-Origin',origin);
     res.setHeader('Access-Control-Allow-Credentials','true');
     res.setHeader('Vary','Origin');
-    res.setHeader('Access-Control-Allow-Headers','Content-Type');
+    res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');
     res.setHeader('Access-Control-Max-Age','86400');
   }
@@ -54,7 +56,7 @@ app.use((req,res,next)=>{
 
 const limiter=rateLimit({windowMs:15*60*1000,limit:12,standardHeaders:'draft-7',legacyHeaders:false});
 const cookieName='elite_session';
-const auth=(req,res,next)=>{try{req.user=jwt.verify(req.cookies[cookieName],process.env.JWT_SECRET,{algorithms:['HS256']});next()}catch{res.status(401).json({error:'Please sign in.'})}};
+const auth=(req,res,next)=>{try{const bearer=/^Bearer (.+)$/i.exec(req.get('Authorization')||'');const token=bearer?.[1]||req.cookies?.[cookieName];const claims=jwt.verify(token,process.env.JWT_SECRET,{algorithms:['HS256']});const current=db.users.find(u=>String(u.id)===String(claims.id));if(!current)return res.status(401).json({error:'Session expired.'});req.user={id:current.id,role:current.role};next()}catch{return res.status(401).json({error:'Please sign in.'})}};
 const admin=(req,res,next)=>req.user.role==='admin'?next():res.status(403).json({error:'Admin access required.'});
 
 function addressOk(addr){if(typeof addr!=='string'||addr.length>100)return false;try{if(/^[13][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr)){let v=0n;for(let c of addr){let n='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'.indexOf(c);if(n<0)return false;v=v*58n+BigInt(n)}let hex=v.toString(16);if(hex.length%2)hex='0'+hex;let bytes=Buffer.from(hex,'hex');let leading=(addr.match(/^1*/)||[''])[0].length;bytes=Buffer.concat([Buffer.alloc(leading),bytes]);if(bytes.length!==25||![0,5].includes(bytes[0]))return false;let raw=bytes.subarray(0,-4),checksum=crypto.createHash('sha256').update(crypto.createHash('sha256').update(raw).digest()).digest();return checksum.subarray(0,4).equals(bytes.subarray(-4))}const s=addr.toLowerCase();if(s!==addr&&addr.toUpperCase()!==addr)return false;if(!s.startsWith('bc1'))return false;const alphabet='qpzry9x8gf2tvdw0s3jn54khce6mua7l',parts=[...s.slice(3)].map(x=>alphabet.indexOf(x));if(parts.some(x=>x<0)||parts.length<8)return false;let pm=1;for(const a of [...[3,3,0,2,3],0,...parts]){let top=pm>>>25;pm=((pm&0x1ffffff)<<5)^a;for(let j=0;j<5;j++)if((top>>>j)&1)pm^=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3][j]}let version=parts[0];return version<=16&&(version===0?pm===1:pm===0x2bc830a3)}catch{return false}}
@@ -75,7 +77,7 @@ async function init(){
 
 function session(res,u){
   res.cookie(cookieName,jwt.sign({id:String(u.id),role:u.role},process.env.JWT_SECRET,{expiresIn:'12h',algorithm:'HS256'}),{httpOnly:true,sameSite:process.env.COOKIE_SAMESITE==='none'?'none':'lax',secure:process.env.COOKIE_SAMESITE==='none'||process.env.NODE_ENV==='production',maxAge:12*3600e3,path:'/'});
-  res.json({user:{id:u.id,fullName:u.full_name,email:u.email,role:u.role,balanceUSD:u.balance_cents/100}});
+  res.json({token:jwt.sign({id:String(u.id),role:u.role},process.env.JWT_SECRET,{expiresIn:'12h',algorithm:'HS256'}),user:{id:u.id,fullName:u.full_name,email:u.email,role:u.role,balanceUSD:u.balance_cents/100}});
 }
 
 app.get('/api/health',(_req,res)=>res.json({status:'ok'}));
