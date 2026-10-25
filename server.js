@@ -9,21 +9,28 @@ const app=express();
 app.disable('x-powered-by');
 app.set('trust proxy',1);
 app.use(helmet({contentSecurityPolicy:false}));
-app.use(express.json({limit:'12kb'}));
+app.use(express.json({limit:'32kb'}));
 app.use(cookieParser());
 
 // ---- JSON store -------------------------------------------------------------
-let db={users:[],platform_settings:{},audit_log:[],funding_requests:[],nextFundingId:1,nextUserId:1,nextAuditId:1};
+let db={
+  users:[],platform_settings:{},audit_log:[],
+  funding_requests:[],kyc_requests:[],withdrawal_requests:[],
+  nextUserId:1,nextAuditId:1,nextFundingId:1,nextKycId:1,nextWithdrawalId:1
+};
 let writing=Promise.resolve();
 
 function loadDb(){
   if(fs.existsSync(DATA_FILE)){
     try{db=JSON.parse(fs.readFileSync(DATA_FILE,'utf8'))}catch(e){throw new Error('data.json is corrupt: '+e.message)}
   }
-  db.users||=[];db.platform_settings||={};db.audit_log||=[];db.funding_requests||=[];
-  db.nextFundingId||=db.funding_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
+  db.users||=[];db.platform_settings||={};db.audit_log||=[];
+  db.funding_requests||=[];db.kyc_requests||=[];db.withdrawal_requests||=[];
   db.nextUserId||=db.users.reduce((m,u)=>Math.max(m,u.id),0)+1;
   db.nextAuditId||=db.audit_log.reduce((m,a)=>Math.max(m,a.id),0)+1;
+  db.nextFundingId||=db.funding_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
+  db.nextKycId||=db.kyc_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
+  db.nextWithdrawalId||=db.withdrawal_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
 }
 
 function saveDb(){
@@ -38,7 +45,6 @@ function saveDb(){
 }
 // ----------------------------------------------------------------------------
 
-// Public cross-origin API: Bearer tokens are used for authentication.
 app.use((req,res,next)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','GET, POST, PUT, PATCH, DELETE, OPTIONS');
@@ -65,7 +71,6 @@ const auth=(req,res,next)=>{
 };
 const admin=(req,res,next)=>req.user.role==='admin'?next():res.status(403).json({error:'Admin access required.'});
 
-// Admin may enter ANY BTC address format. We only require a sane, non-empty string.
 function addressOk(addr){
   return typeof addr==='string' && addr.trim().length>=1 && addr.trim().length<=200 && !/[\s<>"]/.test(addr.trim());
 }
@@ -97,7 +102,7 @@ app.post('/api/auth/signup',limiter,async(req,res,next)=>{try{
   fullName=String(fullName||'').trim();email=String(email||'').toLowerCase().trim();
   if(fullName.length<2||fullName.length>100||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254||typeof password!=='string'||password.length<10||password.length>128||!/[A-Z]/.test(password)||!/[a-z]/.test(password)||!/[0-9]/.test(password))return res.status(400).json({error:'Enter valid registration details and a stronger password.'});
   if(db.users.some(u=>u.email===email))return res.status(409).json({error:'This email is already registered.'});
-  const u={id:db.nextUserId++,full_name:fullName,email,password_hash:await bcrypt.hash(password,12),role:'user',balance_cents:0,created_at:new Date().toISOString()};
+  const u={id:db.nextUserId++,full_name:fullName,email,password_hash:await bcrypt.hash(password,12),role:'user',balance_cents:0,created_at:new Date().toISOString(),twofa_enabled:false,kyc_status:'unverified'};
   db.users.push(u);await saveDb();session(res,u);
 }catch(e){next(e)}});
 
@@ -113,13 +118,71 @@ app.post('/api/auth/logout',(_req,res)=>{res.clearCookie(cookieName,{path:'/'});
 app.get('/api/me',auth,(req,res)=>{
   const u=db.users.find(x=>String(x.id)===String(req.user.id));
   if(!u)return res.status(401).json({error:'Session expired.'});
-  res.json({id:u.id,fullName:u.full_name,email:u.email,role:u.role,balanceUSD:u.balance_cents/100,createdAt:u.created_at});
+  res.json({
+    id:u.id,fullName:u.full_name,email:u.email,role:u.role,
+    balanceUSD:u.balance_cents/100,createdAt:u.created_at,
+    tier:'ELITE USER',
+    twofaEnabled:!!u.twofa_enabled,
+    kycStatus:u.kyc_status||'unverified',
+    withdrawalFeePercent:1
+  });
 });
 
+// ---- User self-service: 2FA toggle ----
+app.post('/api/me/twofa',auth,async(req,res,next)=>{try{
+  const u=db.users.find(x=>String(x.id)===String(req.user.id));
+  if(!u)return res.status(404).json({error:'User not found.'});
+  const enabled=!!req.body.enabled;
+  u.twofa_enabled=enabled;u.session_version=(u.session_version||0)+1;
+  db.audit_log.push({id:db.nextAuditId++,actor_id:u.id,action:'twofa_'+(enabled?'enabled':'disabled'),details:{},created_at:new Date().toISOString()});
+  await saveDb();
+  const token=jwt.sign({id:String(u.id),role:u.role,v:u.session_version},process.env.JWT_SECRET,{expiresIn:TOKEN_TTL,algorithm:'HS256'});
+  res.cookie(cookieName,token,{httpOnly:true,sameSite:process.env.COOKIE_SAMESITE==='none'?'none':'lax',secure:process.env.COOKIE_SAMESITE==='none'||process.env.NODE_ENV==='production',maxAge:COOKIE_TTL_MS,path:'/'});
+  res.json({ok:true,token,twofaEnabled:enabled});
+}catch(e){next(e)}});
+
+// ---- KYC: user submits driver licence / other, admin reviews ----
+app.get('/api/kyc',auth,(req,res)=>{
+  const u=db.users.find(x=>String(x.id)===String(req.user.id));
+  const mine=db.kyc_requests.filter(x=>String(x.user_id)===String(req.user.id)).slice(-1)[0]||null;
+  res.json({status:u?.kyc_status||'unverified',latest:mine});
+});
+app.post('/api/kyc',auth,async(req,res,next)=>{try{
+  const u=db.users.find(x=>String(x.id)===String(req.user.id));
+  if(!u)return res.status(404).json({error:'User not found.'});
+  if(u.kyc_status==='pending')return res.status(409).json({error:'Your verification is already under review.'});
+  const docType=String(req.body.docType||'').trim();
+  const docValue=String(req.body.docValue||'').trim();
+  if(!['driver_licence'].includes(docType))return res.status(400).json({error:'Select a valid document type.'});
+  if(docValue.length<4||docValue.length>300)return res.status(400).json({error:'Enter a valid document number (4–300 characters).'});
+  const entry={id:db.nextKycId++,user_id:u.id,doc_type:docType,doc_value:docValue,status:'pending',created_at:new Date().toISOString(),reviewed_at:null,reviewed_by:null,reason:null};
+  db.kyc_requests.push(entry);u.kyc_status='pending';
+  db.audit_log.push({id:db.nextAuditId++,actor_id:u.id,action:'kyc_submitted',details:{doc_type:docType},created_at:entry.created_at});
+  await saveDb();
+  res.status(201).json({ok:true,request:entry,status:'pending'});
+}catch(e){next(e)}});
+app.get('/api/admin/kyc',auth,admin,(_req,res)=>{
+  res.json({requests:db.kyc_requests.slice(-300).reverse().map(x=>({...x,userEmail:db.users.find(u=>String(u.id)===String(x.user_id))?.email||''}))});
+});
+app.post('/api/admin/kyc/:id/decision',auth,admin,async(req,res,next)=>{try{
+  const id=Number(req.params.id),status=String(req.body.status||''),reason=String(req.body.reason||'').trim();
+  if(!['approved','rejected'].includes(status))return res.status(400).json({error:'Invalid decision.'});
+  const entry=db.kyc_requests.find(x=>x.id===id);if(!entry)return res.status(404).json({error:'KYC request not found.'});
+  if(entry.status!=='pending')return res.status(409).json({error:'Already reviewed.'});
+  if(status==='rejected'&&reason.length<3)return res.status(400).json({error:'Provide a rejection reason (3+ characters).'});
+  const u=db.users.find(x=>String(x.id)===String(entry.user_id));
+  entry.status=status;entry.reason=reason||null;entry.reviewed_at=new Date().toISOString();entry.reviewed_by=req.user.id;
+  if(u)u.kyc_status=status==='approved'?'verified':'rejected';
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'kyc_'+status,details:{request_id:id,user_id:entry.user_id},created_at:entry.reviewed_at});
+  await saveDb();res.json({ok:true,request:entry});
+}catch(e){next(e)}});
+
+// ---- Funding config (admin BTC address) ----
 app.get('/api/funding/config',auth,(_req,res)=>{
   res.json({btcAddress:db.platform_settings.btc_address||null,minimumUSD:20,feePercent:1});
 });
 
+// ---- Funding requests ----
 app.get('/api/funding/requests',auth,(req,res)=>res.json({requests:db.funding_requests.filter(x=>String(x.user_id)===String(req.user.id)).slice(-100).reverse()}));
 app.post('/api/funding/requests',auth,async(req,res,next)=>{try{
   const usd=Number(req.body.amountUSD),btc=Number(req.body.estimatedBTC);
@@ -141,15 +204,61 @@ app.post('/api/admin/funding/:id/decision',auth,admin,async(req,res,next)=>{try{
   db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'funding_'+status,details:{request_id:id,user_id:entry.user_id,amount_cents:entry.amount_usd_cents},created_at:entry.reviewed_at});
   await saveDb();res.json({ok:true,request:entry});
 }catch(e){next(e)}});
+
+// ---- Withdrawal requests ----
+const WITHDRAW_MIN_USD=20;
+const WITHDRAW_FEE_PCT=1;
+
+app.get('/api/withdrawal/config',auth,(_req,res)=>{
+  res.json({minimumUSD:WITHDRAW_MIN_USD,feePercent:WITHDRAW_FEE_PCT});
+});
+app.get('/api/withdrawal/requests',auth,(req,res)=>res.json({requests:db.withdrawal_requests.filter(x=>String(x.user_id)===String(req.user.id)).slice(-100).reverse()}));
+app.post('/api/withdrawal/requests',auth,async(req,res,next)=>{try{
+  const u=db.users.find(x=>String(x.id)===String(req.user.id));
+  if(!u)return res.status(404).json({error:'User not found.'});
+  const usd=Number(req.body.amountUSD),addr=String(req.body.btcAddress||'').trim();
+  if(!Number.isFinite(usd)||usd<WITHDRAW_MIN_USD||usd>1000000)return res.status(400).json({error:`Enter a withdrawal amount of at least $${WITHDRAW_MIN_USD}.`});
+  if(!addressOk(addr))return res.status(400).json({error:'Enter a valid BTC address (no spaces, max 200 chars).'});
+  const feeCents=Math.round(usd*WITHDRAW_FEE_PCT),totalCents=Math.round(usd*100)+feeCents;
+  if(u.balance_cents<totalCents)return res.status(409).json({error:`Insufficient balance. You need $${(totalCents/100).toFixed(2)} (amount + ${WITHDRAW_FEE_PCT}% fee).`});
+  // hold the funds immediately so the balance cannot be double-spent
+  u.balance_cents-=totalCents;
+  const entry={id:db.nextWithdrawalId++,user_id:u.id,amount_usd_cents:Math.round(usd*100),fee_cents:feeCents,btc_address:addr,status:'pending',created_at:new Date().toISOString(),reviewed_at:null,reviewed_by:null,reason:null};
+  db.withdrawal_requests.push(entry);
+  db.audit_log.push({id:db.nextAuditId++,actor_id:u.id,action:'withdrawal_requested',details:{request_id:entry.id,amount_cents:entry.amount_usd_cents,fee_cents:feeCents},created_at:entry.created_at});
+  await saveDb();
+  res.status(201).json({ok:true,request:entry,newBalanceUSD:u.balance_cents/100});
+}catch(e){next(e)}});
+app.get('/api/admin/withdrawals',auth,admin,(_req,res)=>res.json({requests:db.withdrawal_requests.slice(-300).reverse().map(x=>({...x,userEmail:db.users.find(u=>String(u.id)===String(x.user_id))?.email||''}))}));
+app.post('/api/admin/withdrawals/:id/decision',auth,admin,async(req,res,next)=>{try{
+  const id=Number(req.params.id),status=String(req.body.status||''),reason=String(req.body.reason||'').trim();
+  if(!['approved','rejected'].includes(status))return res.status(400).json({error:'Invalid decision.'});
+  const entry=db.withdrawal_requests.find(x=>x.id===id);if(!entry)return res.status(404).json({error:'Withdrawal not found.'});
+  if(entry.status!=='pending')return res.status(409).json({error:'Already reviewed.'});
+  if(status==='rejected'&&reason.length<3)return res.status(400).json({error:'Provide a rejection reason (3+ characters).'});
+  const u=db.users.find(x=>String(x.id)===String(entry.user_id));
+  if(status==='rejected'&&u){
+    // return held funds in full (amount + fee)
+    u.balance_cents+=entry.amount_usd_cents+entry.fee_cents;
+  }
+  entry.status=status;entry.reason=reason||null;entry.reviewed_at=new Date().toISOString();entry.reviewed_by=req.user.id;
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'withdrawal_'+status,details:{request_id:id,user_id:entry.user_id,amount_cents:entry.amount_usd_cents},created_at:entry.reviewed_at});
+  await saveDb();res.json({ok:true,request:entry});
+}catch(e){next(e)}});
+
+// ---- Admin: manual balance adjust (already existed; unchanged) ----
 app.post('/api/admin/users/:id/adjust-balance',auth,admin,async(req,res,next)=>{try{
   const cents=Number(req.body.amountCents),reason=String(req.body.reason||'').trim();
   if(!Number.isSafeInteger(cents)||cents===0||Math.abs(cents)>100000000||reason.length<8||reason.length>300)return res.status(400).json({error:'Provide an adjustment amount and a reason (8–300 characters).'});
   const user=db.users.find(x=>String(x.id)===String(req.params.id));if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
   if(user.balance_cents+cents<0)return res.status(409).json({error:'Insufficient available balance.'});
-  user.balance_cents+=cents;db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'manual_balance_adjustment',details:{user_id:user.id,delta_cents:cents,reason},created_at:new Date().toISOString()});await saveDb();res.json({ok:true,balanceUSD:user.balance_cents/100});
+  user.balance_cents+=cents;
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'manual_balance_adjustment',details:{user_id:user.id,delta_cents:cents,reason},created_at:new Date().toISOString()});
+  await saveDb();res.json({ok:true,balanceUSD:user.balance_cents/100});
 }catch(e){next(e)}});
+
 app.get('/api/admin/users',auth,admin,(_req,res)=>{
-  res.json({users:[...db.users].sort((a,b)=>b.created_at.localeCompare(a.created_at)).slice(0,500).map(x=>({id:x.id,fullName:x.full_name,email:x.email,role:x.role,balanceUSD:x.balance_cents/100,createdAt:x.created_at}))});
+  res.json({users:[...db.users].sort((a,b)=>b.created_at.localeCompare(a.created_at)).slice(0,500).map(x=>({id:x.id,fullName:x.full_name,email:x.email,role:x.role,balanceUSD:x.balance_cents/100,createdAt:x.created_at,kycStatus:x.kyc_status||'unverified',twofaEnabled:!!x.twofa_enabled}))});
 });
 
 app.patch('/api/admin/users/:id',auth,admin,async(req,res,next)=>{try{
@@ -180,6 +289,7 @@ app.delete('/api/admin/users/:id',auth,admin,async(req,res,next)=>{try{
   const user=db.users.find(x=>String(x.id)===String(req.params.id));
   if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
   if(db.funding_requests.some(x=>String(x.user_id)===String(user.id)&&x.status==='processing'))return res.status(409).json({error:'Review pending funding requests before deleting this account.'});
+  if(db.withdrawal_requests.some(x=>String(x.user_id)===String(user.id)&&x.status==='pending'))return res.status(409).json({error:'Review pending withdrawal requests before deleting this account.'});
   db.users=db.users.filter(x=>x.id!==user.id);
   db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'user_deleted',details:{user_id:user.id,email:user.email,balance_cents:user.balance_cents},created_at:new Date().toISOString()});
   await saveDb();res.json({ok:true});
@@ -189,7 +299,6 @@ app.get('/api/admin/audit',auth,admin,(_req,res)=>res.json({events:db.audit_log.
 app.get('/api/admin/settings',auth,admin,(_req,res)=>{
   res.json({btcAddress:db.platform_settings.btc_address||''});
 });
-
 app.put('/api/admin/btc-address',auth,admin,async(req,res,next)=>{try{
   const address=String(req.body.address||'').trim();
   if(!addressOk(address))return res.status(400).json({error:'Enter a valid receiving address (no spaces, max 200 characters).'});
@@ -212,7 +321,6 @@ app.get('/api/market',async(_req,res)=>{try{
 }catch{res.status(503).json({error:'Live market feed unavailable.'})}});
 
 app.use('/api',(_req,res)=>res.status(404).json({error:'API route not found.'}));
-
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Request could not be completed.'})});
 
 init().then(()=>app.listen(process.env.PORT||3000,'0.0.0.0',()=>console.log('Elite Trading server ready'))).catch(e=>{console.error('Initialization failed:',e);process.exit(1)});
