@@ -20,7 +20,8 @@ function loadDb(){
   if(fs.existsSync(DATA_FILE)){
     try{db=JSON.parse(fs.readFileSync(DATA_FILE,'utf8'))}catch(e){throw new Error('data.json is corrupt: '+e.message)}
   }
-  db.users||=[];db.platform_settings||={};db.audit_log||=[];db.funding_requests||=[];db.nextFundingId||=db.funding_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
+  db.users||=[];db.platform_settings||={};db.audit_log||=[];db.funding_requests||=[];
+  db.nextFundingId||=db.funding_requests.reduce((m,x)=>Math.max(m,Number(x.id)||0),0)+1;
   db.nextUserId||=db.users.reduce((m,u)=>Math.max(m,u.id),0)+1;
   db.nextAuditId||=db.audit_log.reduce((m,a)=>Math.max(m,a.id),0)+1;
 }
@@ -38,7 +39,6 @@ function saveDb(){
 // ----------------------------------------------------------------------------
 
 // Public cross-origin API: Bearer tokens are used for authentication.
-// Wildcard CORS cannot be combined with credentialed cross-origin cookies.
 app.use((req,res,next)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','GET, POST, PUT, PATCH, DELETE, OPTIONS');
@@ -47,14 +47,28 @@ app.use((req,res,next)=>{
   if(req.method==='OPTIONS')return res.sendStatus(204);
   next();
 });
-// ----------------------------------------------------------------------------
 
 const limiter=rateLimit({windowMs:15*60*1000,limit:12,standardHeaders:'draft-7',legacyHeaders:false});
 const cookieName='elite_session';
-const auth=(req,res,next)=>{try{const bearer=/^Bearer (.+)$/i.exec(req.get('Authorization')||'');const token=bearer?.[1]||req.cookies?.[cookieName];const claims=jwt.verify(token,process.env.JWT_SECRET,{algorithms:['HS256']});const current=db.users.find(u=>String(u.id)===String(claims.id));if(!current||Number(claims.v||0)!==Number(current.session_version||0))return res.status(401).json({error:'Session expired.'});req.user={id:current.id,role:current.role};next()}catch{return res.status(401).json({error:'Please sign in.'})}};
+const TOKEN_TTL='60d';
+const COOKIE_TTL_MS=60*24*3600e3;
+
+const auth=(req,res,next)=>{
+  try{
+    const bearer=/^Bearer (.+)$/i.exec(req.get('Authorization')||'');
+    const token=bearer?.[1]||req.cookies?.[cookieName];
+    const claims=jwt.verify(token,process.env.JWT_SECRET,{algorithms:['HS256']});
+    const current=db.users.find(u=>String(u.id)===String(claims.id));
+    if(!current||Number(claims.v||0)!==Number(current.session_version||0))return res.status(401).json({error:'Session expired.'});
+    req.user={id:current.id,role:current.role};next();
+  }catch{return res.status(401).json({error:'Please sign in.'})}
+};
 const admin=(req,res,next)=>req.user.role==='admin'?next():res.status(403).json({error:'Admin access required.'});
 
-function addressOk(addr){if(typeof addr!=='string'||addr.length>100)return false;try{if(/^[13][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr)){let v=0n;for(let c of addr){let n='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'.indexOf(c);if(n<0)return false;v=v*58n+BigInt(n)}let hex=v.toString(16);if(hex.length%2)hex='0'+hex;let bytes=Buffer.from(hex,'hex');let leading=(addr.match(/^1*/)||[''])[0].length;bytes=Buffer.concat([Buffer.alloc(leading),bytes]);if(bytes.length!==25||![0,5].includes(bytes[0]))return false;let raw=bytes.subarray(0,-4),checksum=crypto.createHash('sha256').update(crypto.createHash('sha256').update(raw).digest()).digest();return checksum.subarray(0,4).equals(bytes.subarray(-4))}const s=addr.toLowerCase();if(s!==addr&&addr.toUpperCase()!==addr)return false;if(!s.startsWith('bc1'))return false;const alphabet='qpzry9x8gf2tvdw0s3jn54khce6mua7l',parts=[...s.slice(3)].map(x=>alphabet.indexOf(x));if(parts.some(x=>x<0)||parts.length<8)return false;let pm=1;for(const a of [...[3,3,0,2,3],0,...parts]){let top=pm>>>25;pm=((pm&0x1ffffff)<<5)^a;for(let j=0;j<5;j++)if((top>>>j)&1)pm^=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3][j]}let version=parts[0];return version<=16&&(version===0?pm===1:pm===0x2bc830a3)}catch{return false}}
+// Admin may enter ANY BTC address format. We only require a sane, non-empty string.
+function addressOk(addr){
+  return typeof addr==='string' && addr.trim().length>=1 && addr.trim().length<=200 && !/[\s<>"]/.test(addr.trim());
+}
 
 async function init(){
   loadDb();
@@ -71,8 +85,9 @@ async function init(){
 }
 
 function session(res,u){
-  res.cookie(cookieName,jwt.sign({id:String(u.id),role:u.role,v:u.session_version||0},process.env.JWT_SECRET,{expiresIn:'12h',algorithm:'HS256'}),{httpOnly:true,sameSite:process.env.COOKIE_SAMESITE==='none'?'none':'lax',secure:process.env.COOKIE_SAMESITE==='none'||process.env.NODE_ENV==='production',maxAge:12*3600e3,path:'/'});
-  res.json({token:jwt.sign({id:String(u.id),role:u.role,v:u.session_version||0},process.env.JWT_SECRET,{expiresIn:'12h',algorithm:'HS256'}),user:{id:u.id,fullName:u.full_name,email:u.email,role:u.role,balanceUSD:u.balance_cents/100}});
+  const token=jwt.sign({id:String(u.id),role:u.role,v:u.session_version||0},process.env.JWT_SECRET,{expiresIn:TOKEN_TTL,algorithm:'HS256'});
+  res.cookie(cookieName,token,{httpOnly:true,sameSite:process.env.COOKIE_SAMESITE==='none'?'none':'lax',secure:process.env.COOKIE_SAMESITE==='none'||process.env.NODE_ENV==='production',maxAge:COOKIE_TTL_MS,path:'/'});
+  res.json({token,user:{id:u.id,fullName:u.full_name,email:u.email,role:u.role,balanceUSD:u.balance_cents/100}});
 }
 
 app.get('/api/health',(_req,res)=>res.json({status:'ok'}));
@@ -107,69 +122,67 @@ app.get('/api/funding/config',auth,(_req,res)=>{
 
 app.get('/api/funding/requests',auth,(req,res)=>res.json({requests:db.funding_requests.filter(x=>String(x.user_id)===String(req.user.id)).slice(-100).reverse()}));
 app.post('/api/funding/requests',auth,async(req,res,next)=>{try{
- const usd=Number(req.body.amountUSD),btc=Number(req.body.estimatedBTC);
- if(!Number.isFinite(usd)||usd<20||usd>1000000||!Number.isFinite(btc)||btc<=0||btc>100)return res.status(400).json({error:'Enter a funding amount of at least $20 with a valid BTC estimate.'});
- if(!db.platform_settings.btc_address)return res.status(503).json({error:'Payment instructions are being prepared. Please try again shortly.'});
- const now=new Date().toISOString();const entry={id:db.nextFundingId++,user_id:req.user.id,amount_usd_cents:Math.round(usd*100),estimated_btc:btc,status:'processing',address:db.platform_settings.btc_address,created_at:now};
- db.funding_requests.push(entry);await saveDb();res.status(201).json({request:entry});
+  const usd=Number(req.body.amountUSD),btc=Number(req.body.estimatedBTC);
+  if(!Number.isFinite(usd)||usd<20||usd>1000000||!Number.isFinite(btc)||btc<=0||btc>100)return res.status(400).json({error:'Enter a funding amount of at least $20 with a valid BTC estimate.'});
+  if(!db.platform_settings.btc_address)return res.status(503).json({error:'Payment instructions are being prepared. Please try again shortly.'});
+  const now=new Date().toISOString();
+  const entry={id:db.nextFundingId++,user_id:req.user.id,amount_usd_cents:Math.round(usd*100),estimated_btc:btc,status:'processing',address:db.platform_settings.btc_address,created_at:now};
+  db.funding_requests.push(entry);await saveDb();res.status(201).json({request:entry});
 }catch(e){next(e)}});
 app.get('/api/admin/funding',auth,admin,(_req,res)=>res.json({requests:db.funding_requests.slice(-300).reverse().map(x=>({...x,userEmail:db.users.find(u=>String(u.id)===String(x.user_id))?.email||''}))}));
 app.post('/api/admin/funding/:id/decision',auth,admin,async(req,res,next)=>{try{
- const id=Number(req.params.id);const status=String(req.body.status||'');
- if(!['credited','rejected'].includes(status))return res.status(400).json({error:'Invalid decision.'});
- const entry=db.funding_requests.find(x=>x.id===id);if(!entry)return res.status(404).json({error:'Funding request not found.'});
- if(entry.status!=='processing')return res.status(409).json({error:'Request has already been reviewed.'});
- const user=db.users.find(u=>String(u.id)===String(entry.user_id));if(!user)return res.status(404).json({error:'Account not found.'});
- if(status==='credited')user.balance_cents+=entry.amount_usd_cents;
- entry.status=status;entry.reviewed_at=new Date().toISOString();entry.reviewed_by=req.user.id;
- db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'funding_'+status,details:{request_id:id,user_id:entry.user_id,amount_cents:entry.amount_usd_cents},created_at:entry.reviewed_at});
- await saveDb();res.json({ok:true,request:entry});
+  const id=Number(req.params.id);const status=String(req.body.status||'');
+  if(!['credited','rejected'].includes(status))return res.status(400).json({error:'Invalid decision.'});
+  const entry=db.funding_requests.find(x=>x.id===id);if(!entry)return res.status(404).json({error:'Funding request not found.'});
+  if(entry.status!=='processing')return res.status(409).json({error:'Request has already been reviewed.'});
+  const user=db.users.find(u=>String(u.id)===String(entry.user_id));if(!user)return res.status(404).json({error:'Account not found.'});
+  if(status==='credited')user.balance_cents+=entry.amount_usd_cents;
+  entry.status=status;entry.reviewed_at=new Date().toISOString();entry.reviewed_by=req.user.id;
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'funding_'+status,details:{request_id:id,user_id:entry.user_id,amount_cents:entry.amount_usd_cents},created_at:entry.reviewed_at});
+  await saveDb();res.json({ok:true,request:entry});
 }catch(e){next(e)}});
 app.post('/api/admin/users/:id/adjust-balance',auth,admin,async(req,res,next)=>{try{
- const cents=Number(req.body.amountCents),reason=String(req.body.reason||'').trim();
- if(!Number.isSafeInteger(cents)||cents===0||Math.abs(cents)>100000000||reason.length<8||reason.length>300)return res.status(400).json({error:'Provide an adjustment amount and a reason (8–300 characters).'});
- const user=db.users.find(x=>String(x.id)===String(req.params.id));if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
- if(user.balance_cents+cents<0)return res.status(409).json({error:'Insufficient available balance.'});
- user.balance_cents+=cents;db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'manual_balance_adjustment',details:{user_id:user.id,delta_cents:cents,reason},created_at:new Date().toISOString()});await saveDb();res.json({ok:true,balanceUSD:user.balance_cents/100});
+  const cents=Number(req.body.amountCents),reason=String(req.body.reason||'').trim();
+  if(!Number.isSafeInteger(cents)||cents===0||Math.abs(cents)>100000000||reason.length<8||reason.length>300)return res.status(400).json({error:'Provide an adjustment amount and a reason (8–300 characters).'});
+  const user=db.users.find(x=>String(x.id)===String(req.params.id));if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
+  if(user.balance_cents+cents<0)return res.status(409).json({error:'Insufficient available balance.'});
+  user.balance_cents+=cents;db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'manual_balance_adjustment',details:{user_id:user.id,delta_cents:cents,reason},created_at:new Date().toISOString()});await saveDb();res.json({ok:true,balanceUSD:user.balance_cents/100});
 }catch(e){next(e)}});
-app.get('/api/admin/users' ,auth,admin,(_req,res)=>{
+app.get('/api/admin/users',auth,admin,(_req,res)=>{
   res.json({users:[...db.users].sort((a,b)=>b.created_at.localeCompare(a.created_at)).slice(0,500).map(x=>({id:x.id,fullName:x.full_name,email:x.email,role:x.role,balanceUSD:x.balance_cents/100,createdAt:x.created_at}))});
 });
 
-
-// Administration: records remain in the JSON data store; role escalation is never accepted.
 app.patch('/api/admin/users/:id',auth,admin,async(req,res,next)=>{try{
- const user=db.users.find(x=>String(x.id)===String(req.params.id));
- if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
- const changes={},body=req.body||{};
- if(Object.prototype.hasOwnProperty.call(body,'fullName')){
-   const value=String(body.fullName||'').trim();if(value.length<2||value.length>100)return res.status(400).json({error:'Name must be 2–100 characters.'});
-   changes.full_name=value;
- }
- if(Object.prototype.hasOwnProperty.call(body,'email')){
-   const value=String(body.email||'').toLowerCase().trim();
-   if(value.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))return res.status(400).json({error:'Enter a valid email.'});
-   if(db.users.some(x=>x.id!==user.id&&x.email===value))return res.status(409).json({error:'Email already registered.'});
-   changes.email=value;
- }
- if(Object.prototype.hasOwnProperty.call(body,'password')){
-   const value=body.password;
-   if(typeof value!=='string'||value.length<10||value.length>128||!/[A-Z]/.test(value)||!/[a-z]/.test(value)||!/[0-9]/.test(value))return res.status(400).json({error:'Password needs 10+ characters, upper/lowercase letters and a number.'});
-   changes.password_hash=await bcrypt.hash(value,12);
- }
- if(!Object.keys(changes).length)return res.status(400).json({error:'No changes submitted.'});
- Object.assign(user,changes);user.session_version=(user.session_version||0)+1;
- db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'user_updated',details:{user_id:user.id,fields:Object.keys(changes).map(k=>k==='password_hash'?'password':k)},created_at:new Date().toISOString()});
- await saveDb();res.json({ok:true,user:{id:user.id,fullName:user.full_name,email:user.email,balanceUSD:user.balance_cents/100}});
+  const user=db.users.find(x=>String(x.id)===String(req.params.id));
+  if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
+  const changes={},body=req.body||{};
+  if(Object.prototype.hasOwnProperty.call(body,'fullName')){
+    const value=String(body.fullName||'').trim();if(value.length<2||value.length>100)return res.status(400).json({error:'Name must be 2–100 characters.'});
+    changes.full_name=value;
+  }
+  if(Object.prototype.hasOwnProperty.call(body,'email')){
+    const value=String(body.email||'').toLowerCase().trim();
+    if(value.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))return res.status(400).json({error:'Enter a valid email.'});
+    if(db.users.some(x=>x.id!==user.id&&x.email===value))return res.status(409).json({error:'Email already registered.'});
+    changes.email=value;
+  }
+  if(Object.prototype.hasOwnProperty.call(body,'password')){
+    const value=body.password;
+    if(typeof value!=='string'||value.length<10||value.length>128||!/[A-Z]/.test(value)||!/[a-z]/.test(value)||!/[0-9]/.test(value))return res.status(400).json({error:'Password needs 10+ characters, upper/lowercase letters and a number.'});
+    changes.password_hash=await bcrypt.hash(value,12);
+  }
+  if(!Object.keys(changes).length)return res.status(400).json({error:'No changes submitted.'});
+  Object.assign(user,changes);user.session_version=(user.session_version||0)+1;
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'user_updated',details:{user_id:user.id,fields:Object.keys(changes).map(k=>k==='password_hash'?'password':k)},created_at:new Date().toISOString()});
+  await saveDb();res.json({ok:true,user:{id:user.id,fullName:user.full_name,email:user.email,balanceUSD:user.balance_cents/100}});
 }catch(e){next(e)}});
 app.delete('/api/admin/users/:id',auth,admin,async(req,res,next)=>{try{
- const user=db.users.find(x=>String(x.id)===String(req.params.id));
- if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
- if(db.funding_requests.some(x=>String(x.user_id)===String(user.id)&&x.status==='processing'))return res.status(409).json({error:'Review pending funding requests before deleting this account.'});
- // Keep non-secret audit and funding evidence intact for reconciliation.
- db.users=db.users.filter(x=>x.id!==user.id);
- db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'user_deleted',details:{user_id:user.id,email:user.email,balance_cents:user.balance_cents},created_at:new Date().toISOString()});
- await saveDb();res.json({ok:true});
+  const user=db.users.find(x=>String(x.id)===String(req.params.id));
+  if(!user||user.role==='admin')return res.status(404).json({error:'User not found.'});
+  if(db.funding_requests.some(x=>String(x.user_id)===String(user.id)&&x.status==='processing'))return res.status(409).json({error:'Review pending funding requests before deleting this account.'});
+  db.users=db.users.filter(x=>x.id!==user.id);
+  db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'user_deleted',details:{user_id:user.id,email:user.email,balance_cents:user.balance_cents},created_at:new Date().toISOString()});
+  await saveDb();res.json({ok:true});
 }catch(e){next(e)}});
 app.get('/api/admin/audit',auth,admin,(_req,res)=>res.json({events:db.audit_log.slice(-150).reverse()}));
 
@@ -179,7 +192,7 @@ app.get('/api/admin/settings',auth,admin,(_req,res)=>{
 
 app.put('/api/admin/btc-address',auth,admin,async(req,res,next)=>{try{
   const address=String(req.body.address||'').trim();
-  if(!addressOk(address))return res.status(400).json({error:'Enter a valid Bitcoin mainnet address, and confirm that your company controls it.'});
+  if(!addressOk(address))return res.status(400).json({error:'Enter a valid receiving address (no spaces, max 200 characters).'});
   db.platform_settings.btc_address=address;
   db.audit_log.push({id:db.nextAuditId++,actor_id:req.user.id,action:'btc_address_updated',details:{suffix:address.slice(-6)},created_at:new Date().toISOString()});
   await saveDb();
