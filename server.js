@@ -37,18 +37,13 @@ function saveDb(){
 }
 // ----------------------------------------------------------------------------
 
-// ---- CORS: accept every origin ---------------------------------------------
+// Public cross-origin API: Bearer tokens are used for authentication.
+// Wildcard CORS cannot be combined with credentialed cross-origin cookies.
 app.use((req,res,next)=>{
-  const origin=req.get('Origin');
-  const allowed=(process.env.FRONTEND_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean);
-  if(origin && (allowed.includes(origin) || (process.env.NODE_ENV!=='production' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)))){
-    res.setHeader('Access-Control-Allow-Origin',origin);
-    res.setHeader('Access-Control-Allow-Credentials','true');
-    res.setHeader('Vary','Origin');
-    res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');
-    res.setHeader('Access-Control-Max-Age','86400');
-  }
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age','86400');
   if(req.method==='OPTIONS')return res.sendStatus(204);
   next();
 });
